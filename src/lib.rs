@@ -44,7 +44,7 @@ where
                 },
             )
             .field("values", &unsafe {
-                std::mem::transmute::<_, &[K]>(&self.values[0..self.length])
+                std::mem::transmute::<_, &[V]>(&self.values[0..self.length])
             })
             .finish()
     }
@@ -147,6 +147,11 @@ impl<K, V, const B: usize> Node<K, V, B> {
         }
     }
 
+    unsafe fn set_length(&mut self, length: usize) {
+        assert!(length <= B);
+        self.length = length;
+    }
+
     fn new_root(
         pivot_key: K,
         pivot_value: V,
@@ -157,9 +162,9 @@ impl<K, V, const B: usize> Node<K, V, B> {
             let mut node = Node::new();
             node.keys[0].write(pivot_key);
             node.values[0].write(pivot_value);
-            *node.get_edge_mut(0) = Some(left_node);
-            *node.get_edge_mut(1) = Some(right_node);
-            node.length = 1;
+            node.get_edge_uninit_mut(0).write(Some(left_node));
+            node.get_edge_uninit_mut(1).write(Some(right_node));
+            node.set_length(1);
             node
         }
     }
@@ -168,15 +173,22 @@ impl<K, V, const B: usize> Node<K, V, B> {
         if index >= B {
             self.right_edge.assume_init_ref()
         } else {
-            self.edges.get_unchecked(index).assume_init_ref()
+            self.edges[index].assume_init_ref()
         }
     }
 
     unsafe fn get_edge_mut(&mut self, index: usize) -> &mut Option<Box<Node<K, V, B>>> {
+        self.get_edge_uninit_mut(index).assume_init_mut()
+    }
+
+    fn get_edge_uninit_mut(
+        &mut self,
+        index: usize,
+    ) -> &mut MaybeUninit<Option<Box<Node<K, V, B>>>> {
         if index >= B {
-            self.right_edge.assume_init_mut()
+            &mut self.right_edge
         } else {
-            self.edges.get_unchecked_mut(index).assume_init_mut()
+            &mut self.edges[index]
         }
     }
 }
@@ -215,7 +227,7 @@ where
             // If it was found, just return that value
             if found {
                 debug_assert!(left_of_index < self.length);
-                Some(self.values.get_unchecked(left_of_index).assume_init_ref())
+                Some(self.values[left_of_index].assume_init_ref())
             } else {
                 // Not found: search the node that it could be in
                 self.get_edge(left_of_index).as_ref()?.search(key)
@@ -232,9 +244,7 @@ where
             if found {
                 debug_assert!(left_of_index < self.length);
                 InsertResult::Inserted(Some(std::mem::replace(
-                    self.values
-                        .get_unchecked_mut(left_of_index)
-                        .assume_init_mut(),
+                    self.values[left_of_index].assume_init_mut(),
                     value,
                 )))
             } else if let Some(ref mut edge) = self.get_edge_mut(left_of_index) {
@@ -266,57 +276,56 @@ where
                 }
             } else if self.length < B {
                 // If not found, but we have space for it, shift it into place
-                println!("self.length {} < B {}", self.length, B);
                 self.insert_at(left_of_index, key, value);
                 InsertResult::Inserted(None)
             } else {
                 // Not found, we are full. Get the caller to split and try again
-                println!("overflow {}", self.length);
                 InsertResult::Overflow(key, value)
             }
         }
     }
 
     /// Shift everything toward the right to insert at the given position
-    unsafe fn insert_at(&mut self, position: usize, key: K, value: V) {
+    fn insert_at(&mut self, position: usize, key: K, value: V) {
         assert!(self.length < B);
+        assert!(position < B);
         assert!(position <= self.length);
-        println!("insert_at({position}), current length = {}", self.length);
 
-        // Shift keys and values right
-        std::ptr::copy(
-            self.keys.as_ptr().offset(position as isize),
-            self.keys.as_mut_ptr().offset(position as isize + 1),
-            self.length - position,
-        );
-        std::ptr::copy(
-            self.values.as_ptr().offset(position as isize),
-            self.values.as_mut_ptr().offset(position as isize + 1),
-            self.length - position,
-        );
-        self.keys.get_unchecked_mut(position).write(key);
-        self.values.get_unchecked_mut(position).write(value);
-
-        // Handle edges, which should be moved from position + 1
-        if self.length + 1 == B {
-            // Have to move the last edge into the right_edge
-            self.right_edge
-                .write(self.edges.get_unchecked(B - 1).assume_init_read());
+        unsafe {
+            // Shift keys and values right
             std::ptr::copy(
-                self.edges.as_ptr().offset(position as isize + 1),
-                self.edges.as_mut_ptr().offset(position as isize + 2),
-                (self.length - position).saturating_sub(1),
-            );
-        } else {
-            std::ptr::copy(
-                self.edges.as_ptr().offset(position as isize + 1),
-                self.edges.as_mut_ptr().offset(position as isize + 2),
+                self.keys.as_ptr().offset(position as isize),
+                self.keys.as_mut_ptr().offset(position as isize + 1),
                 self.length - position,
             );
-        }
-        self.edges.get_unchecked_mut(position + 1).write(None);
+            std::ptr::copy(
+                self.values.as_ptr().offset(position as isize),
+                self.values.as_mut_ptr().offset(position as isize + 1),
+                self.length - position,
+            );
+            self.keys[position].write(key);
+            self.values[position].write(value);
 
-        self.length += 1;
+            // Handle edges, which should be moved from position + 1
+            if self.length + 1 == B {
+                // Have to move the last edge into the right_edge
+                self.right_edge.write(self.edges[B - 1].assume_init_read());
+                std::ptr::copy(
+                    self.edges.as_ptr().offset(position as isize + 1),
+                    self.edges.as_mut_ptr().offset(position as isize + 2),
+                    (self.length - position).saturating_sub(1),
+                );
+            } else {
+                std::ptr::copy(
+                    self.edges.as_ptr().offset(position as isize + 1),
+                    self.edges.as_mut_ptr().offset(position as isize + 2),
+                    self.length - position,
+                );
+            }
+            self.get_edge_uninit_mut(position + 1).write(None);
+
+            self.length += 1;
+        }
     }
 
     /// Split the node in the middle
@@ -329,38 +338,41 @@ where
             let middle = self.length / 2;
             // SAFETY: left_size and right_size will both be less than B
             let left_size = middle;
-            let right_size = middle.saturating_sub(self.length % 2);
+            let right_size = middle.saturating_sub(middle % 2);
+            debug_assert_eq!(left_size + right_size + 1, self.length);
+
             // Create a manually dropped new node to put everything to the right of the middle into
+            //
+            //  1 2 3       -->              2
+            // a b c d               1 x x       3 x x
+            //                      a b x x     c d x x
             let mut new_node = ManuallyDrop::new(Box::new(Node::new()));
-            std::ptr::copy(
+            std::ptr::copy_nonoverlapping(
                 self.keys.as_ptr().offset(middle as isize + 1),
                 new_node.keys.as_mut_ptr(),
                 right_size,
             );
-            std::ptr::copy(
+            std::ptr::copy_nonoverlapping(
                 self.values.as_ptr().offset(middle as isize + 1),
                 new_node.values.as_mut_ptr(),
                 right_size,
             );
-            std::ptr::copy(
-                self.edges.as_ptr().offset(middle as isize + 2),
+            std::ptr::copy_nonoverlapping(
+                self.edges.as_ptr().offset(middle as isize + 1),
                 new_node.edges.as_mut_ptr(),
-                right_size,
+                right_size + 1,
             );
             if self.length == B {
                 // Move the right edge into the end of the edges
-                new_node
-                    .edges
-                    .get_unchecked_mut(right_size)
-                    .write(self.right_edge.assume_init_read());
+                new_node.edges[right_size].write(self.right_edge.assume_init_read());
             }
             // End of moves, can set the lengths appropriately
-            self.length = left_size;
-            new_node.length = right_size;
+            self.set_length(left_size);
+            new_node.set_length(right_size);
             // SAFETY: now that we've set the lengths, it's safe to take middle, because it won't be
             // dropped twice if something goes wrong.
-            let split_key = self.keys.get_unchecked(middle).assume_init_read();
-            let split_value = self.values.get_unchecked(middle).assume_init_read();
+            let split_key = self.keys[middle].assume_init_read();
+            let split_value = self.values[middle].assume_init_read();
             (split_key, split_value, ManuallyDrop::into_inner(new_node))
         }
     }
@@ -385,7 +397,7 @@ impl<K, V, const B: usize> Drop for Node<K, V, B> {
             for value in &mut self.values[0..self.length] {
                 value.assume_init_drop();
             }
-            self.length = 0;
+            self.set_length(0);
         }
     }
 }
@@ -395,8 +407,6 @@ fn test_insert_get() {
     let mut tree = Optimap::<u32, u32, 6>::new();
 
     for n in 0..100 {
-        println!("{tree:#?}");
-
         tree.insert(n, n * 2);
     }
 
