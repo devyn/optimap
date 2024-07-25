@@ -378,6 +378,113 @@ where
     }
 }
 
+pub struct Iter<'a, K, V, const B: usize> {
+    map: &'a Optimap<K, V, B>,
+    state: Vec<Visitor<'a, K, V, B>>,
+    ended: bool,
+}
+
+struct Visitor<'a, K, V, const B: usize> {
+    node: &'a Node<K, V, B>,
+    index: usize,
+}
+
+enum VisitResult<'a, K, V, const B: usize> {
+    Descend(Visitor<'a, K, V, B>),
+    Element((&'a K, &'a V)),
+    End,
+}
+
+impl<K, V, const B: usize> Optimap<K, V, B> {
+    pub fn iter(&self) -> Iter<'_, K, V, B> {
+        Iter {
+            map: self,
+            state: vec![],
+            ended: false,
+        }
+    }
+}
+
+impl<'a, K, V, const B: usize> Iterator for Iter<'a, K, V, B> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.ended {
+                return None;
+            } else if let Some(current) = self.state.last_mut() {
+                match current.next() {
+                    VisitResult::Descend(next_visitor) => {
+                        self.state.push(next_visitor);
+                        continue;
+                    }
+                    VisitResult::Element(pair) => {
+                        return Some(pair);
+                    }
+                    VisitResult::End => {
+                        self.state.pop();
+                        if self.state.is_empty() {
+                            self.ended = true;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                if let Some(ref root) = self.map.root {
+                    self.state.push(Visitor {
+                        node: root,
+                        index: 0,
+                    });
+                    continue;
+                } else {
+                    self.ended = true;
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+impl<'a, K, V, const B: usize> Visitor<'a, K, V, B> {
+    fn next(&mut self) -> VisitResult<'a, K, V, B> {
+        loop {
+            let pair_index = self.index / 2;
+            if self.index % 2 == 0 {
+                // Edge
+                if pair_index <= self.node.length {
+                    // SAFETY: pair_index is <= length, should be initialized
+                    self.index += 1;
+                    if let Some(found_node) = unsafe { self.node.get_edge(pair_index) } {
+                        return VisitResult::Descend(Visitor {
+                            node: found_node,
+                            index: 0,
+                        });
+                    } else {
+                        continue;
+                    }
+                } else {
+                    return VisitResult::End;
+                }
+            } else {
+                // Key-value pair
+                if pair_index < self.node.length {
+                    // SAFETY: pair_index < length, should be initialized
+                    let (key, value) = unsafe {
+                        (
+                            self.node.keys[pair_index].assume_init_ref(),
+                            self.node.values[pair_index].assume_init_ref(),
+                        )
+                    };
+                    self.index += 1;
+                    return VisitResult::Element((key, value));
+                } else {
+                    return VisitResult::End;
+                }
+            }
+        }
+    }
+}
+
 impl<K, V, const B: usize> Drop for Node<K, V, B> {
     fn drop(&mut self) {
         unsafe {
@@ -413,4 +520,57 @@ fn test_insert_get() {
     println!("{tree:#?}");
 
     assert_eq!(tree.get(&50), Some(&100));
+}
+
+#[test]
+fn test_insert_iter() {
+    let mut tree = Optimap::<u32, u32, 6>::new();
+
+    let values: Vec<(u32, u32)> = (0..100).zip(100..200).collect();
+
+    for (k, v) in values.iter().copied() {
+        tree.insert(k, v);
+    }
+
+    let result_values: Vec<(u32, u32)> = tree
+        .iter()
+        .map(|(k, v)| {
+            let pair = (*k, *v);
+            println!("{pair:?}");
+            pair
+        })
+        .collect();
+
+    assert_eq!(result_values, values);
+}
+
+#[test]
+fn test_insert_iter_random() {
+    let mut tree = Optimap::<u32, u32, 6>::new();
+
+    let values: Vec<(u32, u32)> = (25..50)
+        .chain(0..25)
+        .chain(75..100)
+        .chain(50..75)
+        .map(|item| (item, item + 100))
+        .collect();
+
+    let mut values_sorted = values.clone();
+    values_sorted.sort();
+
+    for (k, v) in values.iter().copied() {
+        tree.insert(k, v);
+    }
+
+    let result_values: Vec<(u32, u32)> = tree
+        .iter()
+        .map(|(k, v)| {
+            let pair = (*k, *v);
+            println!("{pair:?}");
+            pair
+        })
+        .collect();
+
+    // Ensure the result is sorted
+    assert_eq!(result_values, values_sorted);
 }
