@@ -330,11 +330,11 @@ where
 
     /// Split the node in the middle
     fn split(&mut self) -> (K, V, Box<Node<K, V, B>>) {
-        unsafe {
-            // SAFETY: we can only do this operation if this is true. throw in a check for B for
-            // good measure too
-            assert!(self.length > 1 && self.length <= B);
+        // SAFETY: we can only do this operation if this is true. throw in a check for B for
+        // good measure too
+        assert!(self.length > 1 && self.length <= B);
 
+        unsafe {
             let middle = self.length / 2;
             // SAFETY: left_size and right_size will both be less than B
             let left_size = middle;
